@@ -1,0 +1,72 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: rag-server
+
+  # PostgreSQL 연결 (대화 이력 저장)
+  datasource:
+    url: jdbc:postgresql://${PG_HOST:postgres}:5432/${PG_DB:ai_system}
+    username: ${PG_USER:postgres}
+    password: ${PG_PASSWORD:changeme}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update        # 최초 실행 시 테이블 자동 생성
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  # Redis 연결 (세션 캐시)
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: 6379
+      password: ${REDIS_PASSWORD:changeme}
+
+# 애플리케이션 설정
+app:
+  ollama:
+    url: ${OLLAMA_URL:http://ollama:11434}
+    model: exaone
+    num-predict: 1024
+    temperature: 0.7
+    hyde-num-predict: 150
+    hyde-temperature: 0.3
+    agent-num-predict: 512
+    agent-temperature: 0.1
+    timeout-seconds: 120
+
+  milvus:
+    host: ${MILVUS_HOST:milvus}
+    port: 19530
+    collection: knowledge_base
+    top-k-dense: 15
+    top-k-hyde: 10
+    top-n-rerank: 5
+
+  session:
+    ttl-seconds: 7200         # 세션 TTL 2시간
+    max-history-turns: 8      # 최대 대화 이력 턴 수
+
+  agent:
+    max-steps: 8
+
+# Actuator + Prometheus
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+logging:
+  level:
+    com.ai.rag: DEBUG
+    org.springframework: INFO

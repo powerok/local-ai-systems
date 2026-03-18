@@ -1,0 +1,76 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: ai-gateway
+
+  cloud:
+    gateway:
+      routes:
+        # RAG 쿼리 라우트
+        # /api/rag/query → http://rag-server:8080/rag/query
+        - id: rag-query
+          uri: http://rag-server:8080
+          predicates:
+            - Path=/api/rag/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@userKeyResolver}"
+            - name: PiiMaskingFilter
+
+        # Agent 쿼리 라우트
+        # /api/agent/query → http://rag-server:8080/agent/query
+        - id: agent-query
+          uri: http://rag-server:8080
+          predicates:
+            - Path=/api/agent/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 5
+                redis-rate-limiter.burstCapacity: 10
+                key-resolver: "#{@userKeyResolver}"
+
+      # 모든 응답에 추가할 헤더
+      default-filters:
+        - AddResponseHeader=X-Gateway, ai-gateway
+
+  # JWT 인증 설정 (Keycloak 또는 자체 IdP)
+  # 개발 환경에서 Keycloak 없이 테스트 시 SecurityConfig 에서 permitAll 로 변경
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://keycloak:8080/realms/ai/protocol/openid-connect/certs
+
+  # Redis — Rate Limiter 카운터 저장소
+  data:
+    redis:
+      host: ${SPRING_REDIS_HOST:redis}
+      port: 6379
+      password: ${SPRING_REDIS_PASSWORD:changeme}
+
+# Actuator — 헬스체크 및 Prometheus 메트릭 노출
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
+    com.ai.gateway: DEBUG

@@ -1,0 +1,18 @@
+# 멀티스테이지로 APK만 추출 (이미지 크기 최소화)
+FROM ghcr.io/cirruslabs/flutter:stable AS builder
+
+WORKDIR /app
+RUN mkdir -p /output
+COPY . .
+
+ARG API_URL=http://192.168.0.15:8080/api
+ENV API_URL=$API_URL
+
+RUN flutter pub get
+RUN yes | flutter doctor --android-licenses || true
+RUN flutter build apk --release \
+    --dart-define=API_URL=$API_URL
+
+# 최종 스테이지 — APK 파일만 남김
+FROM scratch
+COPY --from=builder /app/build/app/outputs/flutter-apk/app-release.apk /ai-system.apk

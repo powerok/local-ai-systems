@@ -1,0 +1,23 @@
+# ============================================================
+# docker-compose.yml 에 아래 서비스를 추가하세요
+# ============================================================
+
+  # ── Flutter Web Frontend (Nginx) ──────────────────────────
+  frontend:
+    build:
+      context: /ai-system/frontend
+      dockerfile: Dockerfile
+    container_name: ai-system-frontend
+    ports:
+      - "3001:80"          # 호스트 3001 → 컨테이너 80
+    mem_limit: 256m
+    depends_on:
+      - rag-server
+    networks:
+      - ai-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

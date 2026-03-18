@@ -1,0 +1,87 @@
+# docker-compose-airflow.yml
+# 기존 docker-compose.yml 에 추가할 Airflow 서비스
+#
+# 사용법:
+#   docker compose -f docker-compose.yml -f docker-compose-airflow.yml up -d
+#
+# 또는 기존 docker-compose.yml의 services: 블록 아래에 병합
+
+version: "3.8"
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.0-python3.11
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:changeme@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # ETL 환경 변수
+    ETL_DATA_DIR: /ai-system/data
+    ETL_CRAWL_URLS: '[]'          # 크롤링 URL 목록 JSON 배열로 설정
+    MILVUS_HOST: milvus
+    MILVUS_PORT: "19530"
+    PG_HOST: postgres
+    PG_PASSWORD: changeme
+    RAG_SERVER_URL: http://rag-server:8080
+  volumes:
+    - /ai-system/airflow/dags:/opt/airflow/dags
+    - /ai-system/airflow/plugins:/opt/airflow/plugins
+    - /ai-system/airflow/logs:/opt/airflow/logs
+    - /ai-system/data:/ai-system/data          # 문서 데이터 공유
+    - /ai-system/rag_server:/ai-system/rag_server  # pii_scrubber, embedder 공유
+    - /opt/models:/opt/models                  # BGE-M3 모델 공유
+  networks:
+    - ai-net
+  depends_on:
+    - postgres
+
+services:
+
+  # ── Airflow DB 초기화 (최초 1회) ────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: ai-system-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    restart: "no"
+
+  # ── Airflow Webserver ────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: ai-system-airflow-web
+    command: webserver
+    ports:
+      - "8081:8080"    # 호스트 8081 → 컨테이너 8080
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: ai-system-airflow-scheduler
+    command: scheduler
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped

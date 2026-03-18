@@ -1,0 +1,284 @@
+# AI System - Docker Compose Stack
+# VM 내부에서 실행: docker compose up -d
+
+x-airflow-common: &airflow-common
+  image: ai-system/airflow:2.9.0
+  build: .                                  # 이 라인 추가
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    #AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:changeme@postgres/airflow    
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:changeme@postgres/ai_system
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # ETL 환경 변수
+    ETL_DATA_DIR: /ai-system/data
+    ETL_CRAWL_URLS: '[]'          # 크롤링 URL 목록 JSON 배열로 설정
+    MILVUS_HOST: milvus
+    MILVUS_PORT: "19530"
+    PG_HOST: postgres
+    PG_PASSWORD: changeme
+    RAG_SERVER_URL: http://rag-server:8080    
+    #_PIP_ADDITIONAL_REQUIREMENTS: "pymilvus setuptools"    
+    AIRFLOW__OPENLINEAGE__DISABLED: "true" # 이 라인 추가
+    PYTHONPATH: /opt/airflow/plugins    # ← 이 줄 추가
+    AIRFLOW__WEBSERVER__WORKERS: 2
+    AIRFLOW__WEBSERVER__WORKER_TIMEOUT: 300
+  volumes:
+    - /ai-system/airflow/dags:/opt/airflow/dags
+    - /ai-system/airflow/plugins:/opt/airflow/plugins
+    - airflow-logs:/opt/airflow/logs
+    - /ai-system/data:/ai-system/data          # 문서 데이터 공유
+    - /ai-system/rag_server:/ai-system/rag_server  # pii_scrubber, embedder 공유
+    - /opt/models:/opt/models                  # BGE-M3 모델 공유
+  networks:
+    - ai-net
+  depends_on:
+    - postgres
+    
+services:
+
+  # ── Ollama (EXAONE CPU 서빙) ────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    mem_limit: 7g
+    volumes:
+      - ollama_data:/root/.ollama
+      - /opt/models:/opt/models:ro
+      - /ai-system/Modelfile:/Modelfile:ro
+    environment:
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_MAX_LOADED_MODELS=1
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "ollama serve &
+       sleep 5
+       ollama create exaone -f /Modelfile
+       wait"
+    networks: [ai-net]
+    restart: unless-stopped
+
+  # ── Milvus 의존: etcd ──────────────────────────────────────
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    command: >
+      etcd
+      -advertise-client-urls http://etcd:2379
+      -listen-client-urls http://0.0.0.0:2379
+    mem_limit: 512m
+    volumes: [etcd_data:/etcd]
+    networks: [ai-net]
+
+  # ── Milvus 의존: MinIO ─────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+    environment:
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    mem_limit: 1g
+    volumes: [minio_data:/minio_data]
+    networks: [ai-net]
+
+  # ── Milvus Standalone ──────────────────────────────────────
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+    ports:
+      - "19530:19530"
+    mem_limit: 4g
+    depends_on: [etcd, minio]
+    volumes: [milvus_data:/var/lib/milvus]
+    networks: [ai-net]
+
+  # ── Redis ──────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --requirepass changeme
+      --maxmemory 900mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    mem_limit: 1g
+    volumes: [redis_data:/data]
+    networks: [ai-net]
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_PASSWORD=changeme
+      - POSTGRES_DB=ai_system
+    ports:
+      - "5432:5432"
+    mem_limit: 1g
+    volumes: [pg_data:/var/lib/postgresql/data]
+    networks: [ai-net]
+
+  # ── RAG / Agent FastAPI 서버 ───────────────────────────────
+  rag-server:
+    build:
+      context: /ai-system/rag_server
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    mem_limit: 8g
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - MILVUS_HOST=milvus
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=changeme
+      - PG_HOST=postgres
+      - PG_PASSWORD=changeme
+    depends_on:
+      - ollama
+      - milvus
+      - redis
+      - postgres
+    volumes:
+      - /ai-system/rag_server:/app
+      - /opt/models:/opt/models
+    networks: [ai-net]
+    restart: unless-stopped
+
+  # ── Spring Cloud Gateway ───────────────────────────────────
+  gateway:
+    build:
+      context: /ai-system/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    mem_limit: 800m
+    environment:
+      - RAG_SERVER_URL=http://rag-server:8080
+      - SPRING_REDIS_HOST=redis
+      - SPRING_REDIS_PASSWORD=changeme
+    depends_on: [rag-server]
+    networks: [ai-net]
+    restart: unless-stopped
+
+  # ── Prometheus ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    volumes:
+      - /ai-system/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    mem_limit: 512m
+    networks: [ai-net]
+
+  # ── Grafana ────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.1
+    ports:
+      - "3000:3000"
+    mem_limit: 512m
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks: [ai-net]
+
+  # ── Airflow DB 초기화 (최초 1회) ────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: ai-system-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    restart: "no"
+
+  # ── Airflow Webserver ────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: ai-system-airflow-web
+    command: webserver
+    ports:
+      - "8081:8080"    # 호스트 8081 → 컨테이너 8080
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: ai-system-airflow-scheduler
+    command: scheduler
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Flutter Web Frontend (Nginx) ──────────────────────────
+  frontend:
+    build:
+      context: /ai-system/frontend
+      dockerfile: Dockerfile
+    container_name: ai-system-frontend
+    ports:
+      - "3001:80"
+    mem_limit: 256m
+    depends_on:
+      - rag-server
+    networks:
+      - ai-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3    
+  # ── Flutter Android APK Builder ───────────────────────────
+  android-builder:
+    build:
+      context: /ai-system/frontend
+      dockerfile: Dockerfile.android
+    container_name: ai-system-android-builder
+    volumes:
+      - /ai-system/frontend/build/apk:/output   # APK 결과물 저장 경로
+    profiles:
+      - android                                  # 평소엔 실행 안 됨
+    restart: "no"      
+
+volumes:
+  ollama_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  redis_data:
+  pg_data:
+  airflow-logs:
+
+networks:
+  ai-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
